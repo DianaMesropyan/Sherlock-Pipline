@@ -1,0 +1,39 @@
+class Search:
+    def __init__(self):
+        print('loading TF-IDF ...')
+        with open(INDEX / 'tfidf_vectorizer.pkl', 'rb') as f:
+            self.vec = pickle.load(f)
+        self.matrix = sp.load_npz(INDEX / 'tfidf_matrix.npz')
+
+        print('loading embeddings ...')
+        self.emb = np.load(INDEX / 'embeddings.npy')
+
+        print('loading provisions ...')
+        self.provisions = []
+        with open(PROVISIONS, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                self.provisions.append(json.loads(line))
+
+        print('loading model ...')
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.model = SentenceTransformer(
+            MODEL, device=device,
+            model_kwargs={'torch_dtype': torch.float16} if device == 'cuda' else {},
+        )
+        self.model.max_seq_length = MAX_LEN
+        print('ready.')
+
+    def search(self, query, top_k=20, lexical_candidates=1000, alpha=0.4):
+        targets, actions = parse_query(query)
+        print(f'query: {query!r}')
+        print(f'  targets: {targets}')
+        print(f'  actions: {actions}')
+
+        q_vec = self.vec.transform([query.lower()])
+        sims = (self.matrix @ q_vec.T).toarray().ravel()
+        k = min(lexical_candidates, len(sims) - 1)
+        top_idx = np.argpartition(-sims, k)[:k]
+        top_idx = top_idx[np.argsort(-sims[top_idx])]
