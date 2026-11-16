@@ -1,0 +1,314 @@
+import glob
+import json
+from collections import defaultdict
+from pathlib import Path
+import re
+import time
+import pandas as pd
+ 
+# ==============================================================================
+# 1. VOCABULARY WEIGHT PATTERNS
+# ==============================================================================
+ 
+# Creation & Establishment Patterns (+15 Points)
+PATTERNS_CREATION = [
+    r"ստեղծման\s+կարգ",
+    r"ձևավորման\s+կարգ",
+    r"ստեղծվում\s+է",
+    r"սահմանվում\s+է",
+    r"հանդիսանում\s+է\s+բազային",
+    r"համարվում\s+է\s+բազային",
+]
+ 
+# Authority & Maintenance Patterns (+10 Points)
+PATTERNS_AUTHORITY = [
+    r"վարման\s+կարգ",
+    r"պահպանման\s+կարգ",
+    r"գրանցման\s+կարգ",
+    r"հաշվառման\s+կարգ",
+    r"վարում\s+է",
+    r"լիազոր\s+մարմին",
+]
+ 
+# Strict Register Term Patterns (+5 Points)
+PATTERNS_STRICT_NOUNS = [
+    r"պետական\s+ռեգիստր",
+    r"բազային\s+ռեգիստր",
+    r"պետական\s+ռեեստր",
+    r"բազային\s+ռեեստր",
+    r"բազային\s+շտեմարան",
+    r"միասնական\s+ռեգիստր",
+    r"գրանցամատյան",
+]
+ 
+# Database Infrastructure Patterns (+3 Points)
+PATTERNS_DATABASE = [
+    r"տեղեկատվական\s+շտեմարան",
+    r"տվյալների\s+բազա",
+    r"տեղեկատվական\s+համակարգ",
+    r"էլեկտրոնային\s+ռեգիստր",
+    r"էլեկտրոնային\s+ռեեստր",
+    r"պետական\s+տեղեկատվական\s+ռեսուրս",
+]
+ 
+# General Keyword Regex Pattern (+1 Point per occurrence)
+PATTERN_GENERAL = re.compile(
+    r"\b\w*(?:ռեգիստր|ռեեստր|կադաստր|գրանցամատյան|մատյան|շտեմարան)\w*\b",
+    re.IGNORECASE,
+)
+ 
+# Metadata Exclusion Patterns (Ignore repealed or voided acts)
+PATTERNS_METADATA_EXCLUDE = [
+    r"ուժը\s+կորցրել\s+է",  # Repealed
+    r"չեղյալ\s+ճանաչված",  # Voided / Cancelled
+    r"անվավեր",  # Invalid
+]
+ 
+# Compile patterns for fast execution
+REGEX_CREATION = [re.compile(p, re.IGNORECASE) for p in PATTERNS_CREATION]
+REGEX_AUTHORITY = [re.compile(p, re.IGNORECASE) for p in PATTERNS_AUTHORITY]
+REGEX_STRICT = [re.compile(p, re.IGNORECASE) for p in PATTERNS_STRICT_NOUNS]
+REGEX_DATABASE = [re.compile(p, re.IGNORECASE) for p in PATTERNS_DATABASE]
+REGEX_EXCLUDE = [re.compile(p, re.IGNORECASE) for p in PATTERNS_METADATA_EXCLUDE]
+ 
+ 
+# ==============================================================================
+# 2. METADATA INSPECTOR FUNCTION
+# ==============================================================================
+ 
+ 
+def check_metadata_exclusion(rec: dict) -> bool:
+    """Returns True if document metadata indicates it is repealed or invalid."""
+    # Check explicit status fields
+    status = str(
+        rec.get("status") or rec.get("act_status") or rec.get("doc_status") or ""
+    ).lower()
+    if (
+        status in ["repealed", "inactive", "invalid", "void"]
+        or rec.get("is_invalid")
+        or rec.get("repealed")
+    ):
+        return True
+ 
+    # Check title / header text for exclusion phrases
+    title = str(
+        rec.get("act_title_hy") or rec.get("title_hy") or rec.get("title") or ""
+    )
+    for pat in REGEX_EXCLUDE:
+        if pat.search(title) or pat.search(status):
+            return True
+ 
+    return False
+ 
+ 
+# ==============================================================================
+# 3. MAIN CUMULATIVE PIPELINE
+# ==============================================================================
+ 
+ 
+def run_pipeline(dataset_path: str = None):
+    # Locate dataset
+    possible_paths = [
+        dataset_path,
+        "provisions.parquet",
+        "hastat2_provisions.jsonl",
+        "/kaggle/working/provisions.parquet",
+        "/kaggle/input/armenian-legal-provisions/hastat2_provisions.jsonl",
+    ]
+ 
+    file_path = None
+    for p in possible_paths:
+        if p and Path(p).exists():
+            file_path = Path(p)
+            break
+ 
+    if not file_path:
+        raise FileNotFoundError(
+            "Dataset file not found. Provide dataset_path argument."
+        )
+ 
+    print(f"🚀 Ingesting dataset from: {file_path}")
+    t0 = time.time()
+ 
+    # Load records
+    if file_path.suffix == ".parquet":
+        df = pd.read_parquet(file_path)
+        records = df.to_dict(orient="records")
+    else:
+        records = []
+        with open(file_path, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    records.append(json.loads(line))
+ 
+    print(
+        f"📦 Loaded {len(records):,} total provisions in {time.time() - t0:.2f}s\n"
+    )
+ 
+    # Storage map per Act ID
+    acts_map = defaultdict(
+        lambda: {
+            "title": "Untitled Act",
+            "cumulative_score": 0,
+            "peak_provision_score": 0,
+            "provisions_count": 0,
+            "is_ignored": False,
+            "matched_terms": set(),
+        }
+    )
+ 
+    ignored_acts_set = set()
+ 
+    # Process provisions
+    for rec in records:
+        act_id = str(
+            rec.get("act_id")
+            or rec.get("act_id_hy")
+            or rec.get("id")
+            or "UNKNOWN"
+        )
+        title = (
+            rec.get("act_title_hy")
+            or rec.get("title_hy")
+            or rec.get("title")
+            or "Untitled Act"
+        )
+ 
+        acts_map[act_id]["title"] = title
+        acts_map[act_id]["provisions_count"] += 1
+ 
+        # Check metadata exclusion
+        if check_metadata_exclusion(rec):
+            acts_map[act_id]["is_ignored"] = True
+            ignored_acts_set.add(act_id)
+            continue
+ 
+        text = str(
+            rec.get("text_hy") or rec.get("text") or rec.get("full_text") or ""
+        ).lower()
+        if not text:
+            continue
+ 
+        # Evaluate provision weighted score
+        prov_score = 0
+        prov_matches = []
+ 
+        # Creation (+15)
+        for pat in REGEX_CREATION:
+            if pat.search(text):
+                prov_score += 15
+                prov_matches.append(pat.pattern)
+ 
+        # Authority (+10)
+        for pat in REGEX_AUTHORITY:
+            if pat.search(text):
+                prov_score += 10
+                prov_matches.append(pat.pattern)
+ 
+        # Strict Nouns (+5)
+        for pat in REGEX_STRICT:
+            if pat.search(text):
+                prov_score += 5
+                prov_matches.append(pat.pattern)
+ 
+        # Database (+3)
+        for pat in REGEX_DATABASE:
+            if pat.search(text):
+                prov_score += 3
+                prov_matches.append(pat.pattern)
+ 
+        # General Keywords (+1 per match)
+        gen_matches = PATTERN_GENERAL.findall(text)
+        prov_score += len(gen_matches)
+ 
+        # Accumulate into Total Act Score
+        acts_map[act_id]["cumulative_score"] += prov_score
+        acts_map[act_id]["matched_terms"].update(prov_matches + gen_matches)
+ 
+        if prov_score > acts_map[act_id]["peak_provision_score"]:
+            acts_map[act_id]["peak_provision_score"] = prov_score
+ 
+    # Filter active vs ignored acts
+    active_acts = {
+        aid: data for aid, data in acts_map.items() if not data["is_ignored"]
+    }
+ 
+    # Group into Tiers
+    tier_1 = {
+        aid: d
+        for aid, d in active_acts.items()
+        if d["cumulative_score"] >= 15
+    }
+    tier_2 = {
+        aid: d
+        for aid, d in active_acts.items()
+        if 5 <= d["cumulative_score"] < 15
+    }
+    tier_3 = {
+        aid: d
+        for aid, d in active_acts.items()
+        if 1 <= d["cumulative_score"] < 5
+    }
+    tier_4 = {
+        aid: d for aid, d in active_acts.items() if d["cumulative_score"] == 0
+    }
+ 
+    print("=" * 75)
+    print(" 📊 CUMULATIVE REGISTER BASE PIPELINE RESULTS")
+    print("=" * 75)
+    print(f"Total Unique Acts Ingested : {len(acts_map):,}")
+    print(f"Ignored via Metadata       : {len(ignored_acts_set):,}")
+    print(f"Active Evaluated Acts      : {len(active_acts):,}\n")
+    print(f"Tier 1 (Ultra-Strict Base, Score >= 15) : {len(tier_1):,}")
+    print(f"Tier 2 (Medium Candidate, 5-14)         : {len(tier_2):,}")
+    print(f"Tier 3 (Casual Mentions, 1-4)           : {len(tier_3):,}")
+    print(f"Tier 4 (Non-Register Acts, Score = 0)   : {len(tier_4):,}")
+    print("=" * 75 + "\n")
+ 
+    # Construct DataFrame for Export
+    export_data = []
+    for rank, (aid, data) in enumerate(
+        sorted(
+            active_acts.items(),
+            key=lambda x: x[1]["cumulative_score"],
+            reverse=True,
+        ),
+        1,
+    ):
+        score = data["cumulative_score"]
+        tier = (
+            "Tier 1: Top Ultra-Strict Base (Score >= 15)"
+            if score >= 15
+            else (
+                "Tier 2: Medium Candidate (5 <= Score < 15)"
+                if score >= 5
+                else (
+                    "Tier 3: Low Casual Mention (1 <= Score < 5)"
+                    if score >= 1
+                    else "Tier 4: Non-Register (Score = 0)"
+                )
+            )
+        )
+ 
+        export_data.append(
+            {
+                "rank": rank,
+                "act_id": aid,
+                "act_title": data["title"],
+                "total_score": score,
+                "peak_provision_score": data["peak_provision_score"],
+                "tier": tier,
+                "provision_count": data["provisions_count"],
+                "matched_terms_count": len(data["matched_terms"]),
+            }
+        )
+ 
+    export_df = pd.DataFrame(export_data)
+    export_df.to_csv("all_acts_ranked_by_cumulative_score.csv", index=False)
+    print("💾 Saved summary dataset to 'all_acts_ranked_by_cumulative_score.csv'")
+ 
+    return export_df
+ 
+ 
+if __name__ == "__main__":
+    df_result = run_pipeline()
