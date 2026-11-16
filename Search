@@ -1,0 +1,639 @@
+from collections import defaultdict
+
+from datetime import datetime, timezone
+
+import json
+
+import os
+
+from pathlib import Path
+
+import pickle
+
+import re
+
+import time
+ 
+import joblib
+
+import numpy as np
+
+import pandas as pd
+
+from scipy.sparse import load_npz
+
+import torch
+
+from sentence_transformers import SentenceTransformer
+ 
+# ==============================================================================
+
+# 1. DOMAIN VOCABULARY & REGEX COMPILATION
+
+# ==============================================================================
+
+DOMAIN_TARGET_VOCABULARY = {
+
+    "բազային ռեգիստր": 14, "բազային ռեեստր": 14, "բազային շտեմարան": 14,
+
+    "հիմնական ռեգիստր": 12, "հիմնական ռեեստր": 12, "հիմնական շտեմարան": 12,
+
+    "միասնական ռեգիստր": 11, "միասնական ռեեստր": 11, "միասնական պետական ռեգիստր": 13,
+
+    "պետական բազային": 13, "տվյալների բազային": 12, "տվյալների շտեմարան": 10,
+
+    "տեղեկատվական շտեմարան": 9, "պետական ռեգիստր": 10, "պետական ռեեստր": 10,
+
+    "էլեկտրոնային ռեգիստր": 9, "էլեկտրոնային ռեեստր": 9, "պետական տեղեկատվական ռեսուրս": 8,
+
+    "շտեմարան": 7, "ռեգիստր": 7, "ռեեստր": 7, "գրանցամատյան": 7, "կադաստր": 7, "մատյան": 5,
+
+    "տեղեկատվական համակարգ": 6, "տվյալների բազա": 6, "տեղեկատվական ռեսուրս": 4,
+
+}
+ 
+DOMAIN_ACTION_VOCABULARY = {
+
+    "ստեղծ": 5, "ձևավոր": 5, "կազմավոր": 5, "հիմն": 4, "ներդր": 4, "հիմնադր": 5,
+
+    "վար": 5, "պահպան": 4, "կառավար": 4, "շահագործ": 4, "սպասարկ": 4, "թարմաց": 3,
+
+    "գրանց": 4, "հաշվառ": 4, "կազմակերպ": 3, "ներառ": 3, "մուտքագր": 3, "մշակ": 3,
+
+}
+ 
+LEGAL_PATTERNS = {
+
+    r"ստեղծման\s+կարգ": 5, r"վարման\s+կարգ": 6, r"պահպանման\s+կարգ": 4,
+
+    r"գրանցման\s+կարգ": 4, r"հաշվառման\s+կարգ": 4, r"ձևավորման\s+կարգ": 5,
+
+    r"հանդիսանում\s+է\s+բազային": 8, r"համարվում\s+է\s+բազային": 8,
+
+}
+ 
+PENALTY_PATTERNS = {
+
+    r"շտեմարանից\s+ստացված": -5, r"ռեգիստրից\s+ստացված": -5,
+
+    r"ռեեստրից\s+ստացված": -5, r"ռեգիստրի\s+տվյալներով": -3,
+
+}
+ 
+ 
+def compile_vocab(vocab):
+
+    return [
+
+        (weight, re.compile(re.escape(term).replace(r"\ ", r"\s+") + r"\w*", re.IGNORECASE))
+
+        for term, weight in vocab.items()
+
+    ]
+ 
+ 
+COMPILED_DOMAIN_TARGETS = compile_vocab(DOMAIN_TARGET_VOCABULARY)
+
+COMPILED_DOMAIN_ACTIONS = compile_vocab(DOMAIN_ACTION_VOCABULARY)
+
+COMPILED_LEGAL = [(re.compile(p, re.IGNORECASE), w) for p, w in LEGAL_PATTERNS.items()]
+
+COMPILED_PENALTY = [(re.compile(p, re.IGNORECASE), w) for p, w in PENALTY_PATTERNS.items()]
+ 
+REGISTER_KEYWORD_PATTERN = re.compile(
+
+    r'\b\w*(?:ռեգիստր|ռեեստր|կադաստր|մատյան|շտեմարան)\w*\b', re.IGNORECASE
+
+)
+ 
+ACTION_VERB_SUFFIXES = (
+
+    "ստան", "տալ", "տամ", "հան", "գրանց", "վար", "կազմ", "ներկայացն",
+
+    "հայտ", "փոխ", "վճար", "հաստատ", "ստուգ", "լրացն", "դիմ"
+
+)
+ 
+STOP_WORDS_HY = {
+
+    "ինչպես", "ինչ", "որտեղ", "երբ", "ինչու", "ով", "որ", "եվ", "ու", "կամ",
+
+    "այն", "այս", "այդ", "համար", "մասին", "ըստ", "առանց", "հետո", "մինչև"
+
+}
+ 
+# ==============================================================================
+
+# 2. GLOBAL ZERO-COPY CACHE LOADER
+
+# ==============================================================================
+
+GLOBAL_TFIDF = None
+
+GLOBAL_VECTORIZER = None
+
+GLOBAL_DENSE_EMB = None
+
+GLOBAL_MODEL = None
+
+GLOBAL_RECORDS = None
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+ 
+ 
+def ensure_fast_cache_loaded(index_dir: str = "index"):
+
+    global GLOBAL_TFIDF, GLOBAL_VECTORIZER, GLOBAL_DENSE_EMB, GLOBAL_MODEL, GLOBAL_RECORDS
+
+    if GLOBAL_TFIDF is not None:
+
+        return  # Already loaded in memory!
+ 
+    t0 = time.time()
+
+    print("⚡ Pre-loading indexes & model into RAM (one-time operation)...")
+
+    idx_path = Path(index_dir) if Path(index_dir).exists() else Path("/kaggle/working/index")
+ 
+    # 1. Load Sparse TF-IDF (~0.2s)
+
+    GLOBAL_TFIDF = load_npz(idx_path / "tfidf_matrix.npz")
+
+    vec_file = idx_path / "tfidf_vectorizer.pkl"
+
+    try:
+
+        GLOBAL_VECTORIZER = joblib.load(vec_file)
+
+    except Exception:
+
+        with open(vec_file, "rb") as f:
+
+            GLOBAL_VECTORIZER = pickle.load(f)
+ 
+    # 2. Memory-Map Dense Embeddings (~0.01s instant)
+
+    emb_file = idx_path / "embeddings.npy" if (idx_path / "embeddings.npy").exists() else idx_path / "dense_matrix.npy"
+
+    if emb_file.exists():
+
+        GLOBAL_DENSE_EMB = np.load(emb_file, mmap_mode="r")
+ 
+    # 3. Load Dense Model (~0.5s)
+
+    if GLOBAL_DENSE_EMB is not None:
+
+        dim = GLOBAL_DENSE_EMB.shape[1]
+
+        model_name = "BAAI/bge-m3" if dim == 1024 else "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
+
+        os.environ["HF_HOME"] = "/kaggle/working/.cache"
+
+        GLOBAL_MODEL = SentenceTransformer(model_name, device=DEVICE)
+ 
+    # 4. Fast Dataset Pre-loading (Parquet or JSONL into RAM) (~0.3s)
+
+    parquet_path = Path("/kaggle/working/provisions.parquet")
+
+    dataset_file = Path("/kaggle/input/datasets/ineedyoutowork/armenian-legal-provisions/hastat2_provisions.jsonl")
+
+    if not dataset_file.exists():
+
+        dataset_file = Path("/kaggle/input/armenian-legal-provisions/hastat2_provisions.jsonl")
+ 
+    if parquet_path.exists():
+
+        GLOBAL_RECORDS = pd.read_parquet(parquet_path).to_dict(orient="records")
+
+    else:
+
+        # Convert JSONL to Parquet on first run for permanent ultra-fast startup
+
+        df = pd.read_json(dataset_file, lines=True)
+
+        df.to_parquet(parquet_path, engine="pyarrow")
+
+        GLOBAL_RECORDS = df.to_dict(orient="records")
+ 
+    print(f"✅ Cache ready in {time.time() - t0:.2f} seconds! ({len(GLOBAL_RECORDS):,} provisions in RAM)")
+ 
+ 
+# ==============================================================================
+
+# 3. SCORING & PARSING UTILITIES
+
+# ==============================================================================
+
+def normalize_text(text: str) -> str:
+
+    if not text:
+
+        return ""
+
+    text = text.lower()
+
+    text = re.sub(r"(\w)-\s*\n\s*(\w)", r"\1\2", text)
+
+    return re.sub(r"\s+", " ", text).strip()
+ 
+ 
+def parse_query_dynamic(query: str):
+
+    clean_q = re.sub(r"[^\w\s]", "", query.lower()).strip()
+
+    tokens = clean_q.split()
+
+    targets, actions = [], []
+
+    for token in tokens:
+
+        if token in STOP_WORDS_HY or len(token) < 3:
+
+            continue
+
+        is_action = False
+
+        for act in ACTION_VERB_SUFFIXES:
+
+            if act in token:
+
+                actions.append(act)
+
+                is_action = True
+
+                break
+
+        if not is_action:
+
+            stem = token[:6] if len(token) >= 6 else token[:5] if len(token) >= 5 else token
+
+            targets.append(stem)
+
+    return targets, actions
+ 
+ 
+def split_subchunks(text: str, max_chars: int = 400) -> list[str]:
+
+    if not text:
+
+        return []
+
+    paras = [p.strip() for p in re.split(r'\n\s*\n', text) if p.strip()]
+
+    subchunks = []
+
+    for para in paras:
+
+        if len(para) > max_chars:
+
+            sents = re.split(r'(?<=[․.:;\n])\s+', para)
+
+            curr, curr_len = [], 0
+
+            for s in sents:
+
+                if curr_len + len(s) > max_chars and curr:
+
+                    subchunks.append(" ".join(curr))
+
+                    curr, curr_len = [s], len(s)
+
+                else:
+
+                    curr.append(s)
+
+                    curr_len += len(s)
+
+            if curr:
+
+                subchunks.append(" ".join(curr))
+
+        else:
+
+            subchunks.append(para)
+
+    return subchunks or [text[:max_chars]]
+ 
+ 
+def score_subchunk_full(subchunk_text: str, q_targets: list[str], q_actions: list[str], base_sim: float):
+
+    norm_text = normalize_text(subchunk_text)
+
+    if not norm_text:
+
+        return None
+ 
+    score = base_sim * 10.0
+
+    evidence = [f"SIM(+{base_sim*10:.2f})"]
+ 
+    # 1. Dynamic Query Target & Action Matches
+
+    matched_q_targets = [t for t in q_targets if t in norm_text]
+
+    matched_q_actions = [a for a in q_actions if a in norm_text]
+ 
+    for t in matched_q_targets:
+
+        score += 5.0
+
+        evidence.append(f"Q_TARGET({t}: +5)")
+ 
+    for a in matched_q_actions:
+
+        score += 4.0
+
+        evidence.append(f"Q_ACTION({a}: +4)")
+ 
+    if matched_q_targets and matched_q_actions:
+
+        score += 6.0
+
+        evidence.append("Q_TARGET_ACTION_COOCCUR(+6)")
+ 
+    # 2. Domain Base Register Vocabulary Boost
+
+    domain_match = None
+
+    for weight, pat in COMPILED_DOMAIN_TARGETS:
+
+        m = pat.search(norm_text)
+
+        if m and (domain_match is None or weight > domain_match["weight"]):
+
+            domain_match = {"matched": m.group(0), "weight": weight, "start": m.start(), "end": m.end()}
+ 
+    if domain_match:
+
+        score += domain_match["weight"]
+
+        evidence.append(f"DOMAIN_BASE({domain_match['matched']}: +{domain_match['weight']})")
+ 
+        # Action Verb Proximity
+
+        best_act_score = -1
+
+        best_act = None
+
+        for weight, pat in COMPILED_DOMAIN_ACTIONS:
+
+            for m in pat.finditer(norm_text):
+
+                dist = (
+
+                    max(0, m.start() - domain_match["end"])
+
+                    if m.start() >= domain_match["end"]
+
+                    else max(0, domain_match["start"] - m.end())
+
+                )
+
+                prox = 3 if dist <= 80 else (2 if dist <= 150 else (1 if dist <= 250 else 0))
+
+                if weight + prox > best_act_score:
+
+                    best_act_score = weight + prox
+
+                    best_act = (m.group(0), weight, prox)
+ 
+        if best_act:
+
+            score += best_act[1] + best_act[2]
+
+            evidence.append(f"DOMAIN_ACTION({best_act[0]}: +{best_act[1]+best_act[2]})")
+ 
+    # 3. Legal Procedural Patterns & Penalties
+
+    legal_val = sum(w for pat, w in COMPILED_LEGAL if pat.search(norm_text))
+
+    if legal_val > 0:
+
+        score += min(legal_val, 8)
+
+        evidence.append(f"LEGAL_PROC(+{min(legal_val, 8)})")
+ 
+    pen_val = sum(w for pat, w in COMPILED_PENALTY if pat.search(norm_text))
+
+    if pen_val < 0:
+
+        score += max(pen_val, -8)
+
+        evidence.append(f"PENALTY({max(pen_val, -8)})")
+ 
+    return {
+
+        "score": round(score, 4),
+
+        "matched_q_targets": matched_q_targets,
+
+        "matched_q_actions": matched_q_actions,
+
+        "domain_register": domain_match["matched"] if domain_match else "N/A",
+
+        "evidence": evidence,
+
+        "subchunk_excerpt": subchunk_text[:160],
+
+    }
+ 
+ 
+# ==============================================================================
+
+# 4. SUB-SECOND SEARCH EXECUTION ENGINE
+
+# ==============================================================================
+
+def run_fast_search_with_vocab(
+
+    query: str,
+
+    index_dir: str = "index",
+
+    top_k_acts: int = 10,
+
+    top_n_candidates: int = 300,
+
+    output_dir: str = "/kaggle/working/submissions",
+
+):
+
+    ensure_fast_cache_loaded(index_dir)
+
+    start_time = time.time()
+ 
+    q_targets, q_actions = parse_query_dynamic(query)
+
+    norm_q = normalize_text(query)
+ 
+    # Fast Hybrid Vector Search
+
+    q_sparse = GLOBAL_VECTORIZER.transform([norm_q])
+
+    sparse_sims = (GLOBAL_TFIDF @ q_sparse.T).toarray().ravel()
+ 
+    if GLOBAL_DENSE_EMB is not None and GLOBAL_MODEL is not None:
+
+        q_dense = GLOBAL_MODEL.encode([norm_q], normalize_embeddings=True, device=DEVICE)[0]
+
+        dense_sims = np.dot(GLOBAL_DENSE_EMB, q_dense)
+
+        combined_sims = 0.5 * sparse_sims + 0.5 * dense_sims
+
+    else:
+
+        combined_sims = sparse_sims
+ 
+    # Instant Top Candidate Selection via Partitioning
+
+    top_n_idx = np.argpartition(combined_sims, -top_n_candidates)[-top_n_candidates:]
+
+    top_n_idx = top_n_idx[np.argsort(-combined_sims[top_n_idx])]
+ 
+    act_groups = defaultdict(lambda: {
+
+        "act_id": None,
+
+        "act_title": None,
+
+        "total_score": 0.0,
+
+        "relevant_provisions_count": 0,
+
+        "relevant_provisions": [],
+
+        "register_bases": set(),
+
+    })
+ 
+    # Vocabulary & Subchunk Scoring from RAM
+
+    for idx in top_n_idx:
+
+        sim = float(combined_sims[idx])
+
+        if sim <= 0.001 or idx >= len(GLOBAL_RECORDS):
+
+            continue
+ 
+        rec = GLOBAL_RECORDS[idx]
+
+        full_text = rec.get("text_hy") or rec.get("text") or rec.get("full_text") or ""
+
+        subchunks = split_subchunks(full_text)
+ 
+        best_subchunk = None
+
+        for c_idx, sub_text in enumerate(subchunks):
+
+            scored = score_subchunk_full(sub_text, q_targets, q_actions, sim)
+
+            if scored:
+
+                if best_subchunk is None or scored["score"] > best_subchunk["score"]:
+
+                    best_subchunk = scored
+
+                    best_subchunk["chunk_index"] = c_idx + 1
+ 
+        if best_subchunk:
+
+            act_id = str(rec.get("act_id") or rec.get("act_id_hy") or rec.get("id") or "UNKNOWN_ACT")
+
+            act_title = rec.get("act_title_hy") or rec.get("title_hy") or rec.get("title") or "Untitled Act"
+ 
+            grp = act_groups[act_id]
+
+            grp["act_id"] = act_id
+
+            grp["act_title"] = act_title
+
+            grp["total_score"] += best_subchunk["score"]
+
+            grp["relevant_provisions_count"] += 1
+
+            grp["relevant_provisions"].append(best_subchunk)
+ 
+            # Register Bases Extractor
+
+            found_regs = REGISTER_KEYWORD_PATTERN.findall(full_text.lower())
+
+            for reg in found_regs:
+
+                grp["register_bases"].add(reg)
+ 
+    sorted_acts = sorted(act_groups.values(), key=lambda x: x["total_score"], reverse=True)[:top_k_acts]
+ 
+    formatted_results = []
+
+    for act in sorted_acts:
+
+        reg_list = list(act["register_bases"])[:6]
+
+        formatted_results.append({
+
+            "act_id": act["act_id"],
+
+            "act_title": act["act_title"],
+
+            "total_score": round(act["total_score"], 4),
+
+            "relevant_provisions_count": act["relevant_provisions_count"],
+
+            "register_bases": reg_list,
+
+            "provisions": sorted(act["relevant_provisions"], key=lambda p: p["score"], reverse=True),
+
+        })
+ 
+    elapsed = time.time() - start_time
+
+    print(f"⚡ Search completed in {elapsed:.2f} seconds!\n")
+ 
+    for rank, act in enumerate(formatted_results, 1):
+
+        reg_str = ", ".join(act["register_bases"]) if act["register_bases"] else "None"
+
+        print(f"#{rank:02d} | ACT ID: {act['act_id']} | Total Aggregated Score: {act['total_score']:.4f}")
+
+        print(f"    Title               : {act['act_title']}")
+
+        print(f"    Relevant Provisions : {act['relevant_provisions_count']}")
+
+        print(f"    Register Bases      : {reg_str}\n")
+ 
+    out_dir = Path(output_dir)
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    save_path = out_dir / "indexed_top10_act_ids.json"
+
+    with save_path.open("w", encoding="utf-8") as f:
+
+        json.dump(
+
+            {
+
+                "query": query,
+
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+
+                "top_acts": formatted_results,
+
+            },
+
+            f,
+
+            ensure_ascii=False,
+
+            indent=2,
+
+        )
+ 
+    return formatted_results
+ 
+ 
+# Execute search
+
+results = run_fast_search_with_vocab(query="ինչպես ստանալ վարորդական իրավունք")
+ 
